@@ -38,20 +38,27 @@
 #define EVENT_SIZE  ( sizeof (struct inotify_event) )
 #define EVENT_BUF_LEN     ( 1024 * ( EVENT_SIZE + 16 ) )
 
-static const unsigned char cmd_part1[] = {0xa1, 0x6a, 0x1f, 0x00, 0x10};
-static const unsigned char cmd_part2[] = {0x3f, 0x00, 0x00, 0x00, 0x00};
-static const int USB_VENDOR_ID = 0x1a86;
-static const int USB_PROUCT_ID = 0x5512;
-static const int FIRST_PIN = 1;
-static const int LAST_PIN = 8;
+static const uint16_t ch341a_USB_VENDOR_ID = 0x1a86;
+static const uint16_t ch341a_USB_PROUCT_ID = 0x5512;
+static const int ch341a_FIRST_PIN = 1;
+static const int ch341a_LAST_PIN = 8;
+
+/* For API documentation see iosolution.h */
+/* I2CSolution van Elomax is USB device */
+static const uint16_t ELOMAX_USB_VENDOR_ID = 0x07a0;
+static const uint16_t ELOMAX_USB_PRODUCT_ID = 0x1008;
+#define SEND_PACKET_LEN 8
+#define USB_TIMEOUT 1000
 
 typedef struct
 {
     uint32_t active_relays; // bit mask requested 
     uint32_t outputbits; // bit mask set
+    uint8_t data[8]; // buf for Elomax
 
     libusb_context *usb_context; // pointer to usb context
-    libusb_device_handle *device_handle; // pointer to the usb device handle 
+    libusb_device_handle *device_handle; // pointer to the usb device handle
+    uint32_t device_brand; /* 0 = ch341a 1= Elomax IOsolutions I2c device */
 
     /* flag when output needs to be sent, but is not yet done (retry later ?) */
     int output_pending; // cleared by write success 
@@ -61,17 +68,100 @@ typedef struct
     char *event_dir; // where to listen and send events
 } ios_handle_t;
 
+/* declaration */
+int USB_write_IO(ios_handle_t *handle);
+
+/* implementation */
+static int
+ios_send(ios_handle_t *handle)
+{
+    /* bmRequest Type	 
+     * Bit 7: Request direction (0=Host to device – Out, 1=Device to host – In).
+     * Bits 5-6: Request type (0=standard, 1=class, 2=vendor, 3=reserved).
+     *  Bits 0-4: Recipient (0=device, 1=interface, 2=endpoint, 3=other).
+     */
+    /* int usb_control_msg(
+     * usb_dev_handle *dev,
+     * int requesttype, 0x21 see doc
+     * int request, 0x09 (set configuration)
+     * int value, (??)
+     * int index, (??)
+     * char *bytes, (data)
+     * int size, (number of bytes in data)
+     * int timeout); (milli seconds)
+     * */
+    //libusb_set_configuration()
+    /* 0x21 Byte : 0010 0001 , class, interface, host to device */
+    if (handle->device_handle == NULL) {
+        fprintf(stderr, "could not send, handle==null\n");
+        return (-1);
+    }
+
+    int writen_size = libusb_control_transfer(
+                                              handle->device_handle, 0x21,
+                                              LIBUSB_REQUEST_SET_CONFIGURATION,
+                                              0x00, 0,
+                                              handle->data, SEND_PACKET_LEN,
+                                              1000);
+
+    if (writen_size != SEND_PACKET_LEN) {
+        fprintf(stderr, "Failed to send all the byte of the packet (%i)\n", writen_size);
+
+    }
+
+    return writen_size;
+}
+
 int
+USB_setup_device(ios_handle_t *handle)
+{
+    /* the elomax device needs some setup before accepting commands */
+    if (handle->device_brand == 1) {
+        /* Elomax setup */
+        /* setup the pull up resistors */
+        handle->data[0] = 0x55;
+        handle->data[1] = 0xFF;
+        handle->data[2] = 0xFF;
+        int r;
+        r = ios_send(handle);
+        if (r < 0) {
+            if (handle->device_handle != NULL) {
+                libusb_close(handle->device_handle);
+            }
+            handle->device_handle = NULL;
+            handle->output_pending = 1;
+            return -1;
+        } else {
+            /* success */
+            /* check for pending output and do it */
+            if (handle->output_pending) {
+                if (USB_write_IO(handle) != -1) {
+                    return 0;
+                } else {
+                    return -1;
+                }
+            }
+        }
+    } else {
+        /* no special handling for ch341a */
+    }
+    return 0;
+}
+
+static int
 send_relay_cmd(libusb_device_handle *dev, uint8_t cmd, uint8_t verbose)
 {
+    static const unsigned char ch341a_cmd_part1[] = {0xa1, 0x6a, 0x1f, 0x00, 0x10};
+    static const unsigned char ch341a_cmd_part2[] = {0x3f, 0x00, 0x00, 0x00, 0x00};
+
     uint8_t buf[32] = {0}; // buf is large enough
-    int n = sizeof (cmd_part1);
-    int m = sizeof (cmd_part2);
+    int n = sizeof (ch341a_cmd_part1);
+    int m = sizeof (ch341a_cmd_part2);
 
     /* fill buf with complete message */
-    memcpy(buf, cmd_part1, n);
+    memcpy(buf, ch341a_cmd_part1, n);
     buf[n] = cmd;
-    memcpy(buf + n + 1, cmd_part2, m);
+    memcpy(buf + n + 1, ch341a_cmd_part2, m);
 
     /* send message to usb endpoint */
     static const int endpointid = 2; // for some reason
@@ -104,25 +194,54 @@ USB_write_IO(ios_handle_t *handle)
     uint8_t active_relays = (uint8_t) handle->active_relays;
     uint8_t verbose = handle->verbose;
 
-    /* Send the command frame */
-    if (send_relay_cmd(dev, 0x00, verbose)) goto error;
-    /* send stuff for every bit in the mask */
-    for (uint8_t mask = 128; mask > 0; mask >>= 1) {
-        if (active_relays & mask) {
-            /* Send "relay on" */
-            if (send_relay_cmd(dev, 0x20, verbose)) goto error;
-            if (send_relay_cmd(dev, 0x28, verbose)) goto error;
-            if (send_relay_cmd(dev, 0x20, verbose)) goto error;
+    if (handle->device_brand == 1) {
+        // do the Elomax protocol
+        handle->data[0] = 0x4F; /* command for i2csolution */
+        handle->data[1] = 0x00; /* port 0 output */
+        handle->data[2] = 0x00; /* port 1 output */
+        handle->data[3] = 0x00;
+        handle->data[4] = 0x00;
+        handle->data[5] = 0x00;
+        handle->data[6] = 0x00;
+        handle->data[7] = 0x00;
+
+        handle->data[1] = (unsigned char) active_relays; /* bitjes van poort 0 */
+        handle->data[2] = 0xFF; /* bitjes van poort 1 (inputs) allemaal hoog wegens pullups */
+
+        int r = ios_send(handle);
+        if (r < 0) {
+            if (handle->device_handle != NULL)
+                libusb_close(handle->device_handle);
+            handle->device_handle = NULL;
+            handle->output_pending = 1;
         } else {
-            /* Send "relay off" */
-            if (send_relay_cmd(dev, 0x00, verbose)) goto error;
-            if (send_relay_cmd(dev, 0x08, verbose)) goto error;
-            if (send_relay_cmd(dev, 0x00, verbose)) goto error;
+            /* succes, so reset flag */
+            handle->outputbits = active_relays; /* keep state here */
+            handle->output_pending = 0;
         }
+
+    } else {
+        // do the ch341a protocol
+        /* Send the command frame */
+        if (send_relay_cmd(dev, 0x00, verbose)) goto error;
+        /* send stuff for every bit in the mask */
+        for (uint8_t mask = 128; mask > 0; mask >>= 1) {
+            if (active_relays & mask) {
+                /* Send "relay on" */
+                if (send_relay_cmd(dev, 0x20, verbose)) goto error;
+                if (send_relay_cmd(dev, 0x28, verbose)) goto error;
+                if (send_relay_cmd(dev, 0x20, verbose)) goto error;
+            } else {
+                /* Send "relay off" */
+                if (send_relay_cmd(dev, 0x00, verbose)) goto error;
+                if (send_relay_cmd(dev, 0x08, verbose)) goto error;
+                if (send_relay_cmd(dev, 0x00, verbose)) goto error;
+            }
+        }
+        /* End the command frame */
+        if (send_relay_cmd(dev, 0x00, verbose)) goto error;
+        if (send_relay_cmd(dev, 0x01, verbose)) goto error;
     }
-    /* End the command frame */
-    if (send_relay_cmd(dev, 0x00, verbose)) goto error;
-    if (send_relay_cmd(dev, 0x01, verbose)) goto error;
 
     /* Remember the status */
     handle->output_pending = 0;
@@ -137,7 +256,7 @@ error:
 }
 
 int
-USB_open_device(ios_handle_t *handle)
+USB_open_device(ios_handle_t *handle, uint16_t VID, uint16_t PID)
 {
     assert(handle->device_handle == NULL);
 
@@ -164,7 +283,7 @@ USB_open_device(ios_handle_t *handle)
     if (handle->verbose)
         fprintf(stderr, "[%ld] Devices in list.\n", cnt);
 
-    udh = libusb_open_device_with_vid_pid(ctx, USB_VENDOR_ID, USB_PROUCT_ID);
+    udh = libusb_open_device_with_vid_pid(ctx, VID, PID); // ch341a_USB_VENDOR_ID, ch341a_USB_PROUCT_ID
     if (!udh) {
         fprintf(stderr, "Cannot open device: libusb %p\n", udh);
         return -1;
@@ -224,7 +343,7 @@ run_once(ios_handle_t *h, int argc, char *argv[])
     /* just set some outputs on or off and quit */
     for (int i = optind; i < argc; i++) {
         int relay = atoi(argv[i]);
-        if (relay < FIRST_PIN || relay > LAST_PIN) {
+        if (relay < ch341a_FIRST_PIN || relay > ch341a_LAST_PIN) {
             fprintf(stderr, "error: only give valid relay numbers (1-8) as parameter\n");
             fprintf(stderr, "you can use -v as first option to enable verbose output debugging\n");
             fprintf(stderr, "example: ./%s -v 1 5 7 will switch 1 5 and 7 on the rest will be off\n", argv[0]);
@@ -235,7 +354,15 @@ run_once(ios_handle_t *h, int argc, char *argv[])
     if (h->verbose)
         fprintf(stderr, "writing byte %d to usb\n", h->active_relays);
 
-    if (0 == USB_open_device(h)) {
+    int vid = ch341a_USB_VENDOR_ID;
+    int pid = ch341a_USB_PROUCT_ID;
+    if (h->device_brand == 1) {
+        vid = ELOMAX_USB_VENDOR_ID;
+        pid = ELOMAX_USB_PRODUCT_ID;
+    }
+
+    if (0 == USB_open_device(h, vid, pid)) {
+        USB_setup_device(h);
         USB_write_IO(h);
         USB_close_device(h);
     } else {
@@ -252,9 +379,18 @@ run_as_daemon(ios_handle_t *h)
         fprintf(stderr, "Keep Running, daemon not forking, eventpath=%s pid=%d\n",
                 h->event_dir, getpid());
 
+    int vid = ch341a_USB_VENDOR_ID;
+    int pid = ch341a_USB_PROUCT_ID;
+
+    if (h->device_brand == 1) {
+        vid = ELOMAX_USB_VENDOR_ID;
+        pid = ELOMAX_USB_PRODUCT_ID;
+    }
+
     /* connect to USB IO board */
     while (1) {
-        if (0 == USB_open_device(h)) {
+        if (0 == USB_open_device(h, vid, pid)) {
+            USB_setup_device(h);
             break;
         } else {
             fprintf(stderr, "IO board not found, try again in 1 sec\n");
@@ -287,7 +423,7 @@ run_as_daemon(ios_handle_t *h)
     char b[4096] = {0};
     struct stat sb;
     unsigned relaybits = 0;
-    for (i = FIRST_PIN; i != LAST_PIN; i++) {
+    for (i = ch341a_FIRST_PIN; i != ch341a_LAST_PIN; i++) {
         int len = snprintf(b, sizeof (b), "%s/D_OUT_%d", h->event_dir, i);
         if (h->verbose)
             fprintf(stderr, "stat( %s ) len=%d\n", b, len);
@@ -386,7 +522,7 @@ main(int argc, char *argv[])
     opterr = 0;
     int c;
 
-    while ((c = getopt(argc, argv, "dhi:sv")) != -1)
+    while ((c = getopt(argc, argv, "dhi:svm:")) != -1)
         switch (c) {
         case 'v':
             h->verbose = 1;
@@ -404,6 +540,15 @@ main(int argc, char *argv[])
             fprintf(stderr, "Help Text here");
             abort();
             break;
+        case 'm':
+            /* device brand/protocol 0=ch341 1=elomax */
+            h->device_brand = atoi(optarg);
+            if (h->device_brand > 1) {
+                fprintf(stderr, "devicebrand must be 0 or 1, (ch341=0 or Elomax=1)\n");
+                abort();
+            }
+            break;
+
         default:
             abort();
         }
