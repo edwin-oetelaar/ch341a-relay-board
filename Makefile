@@ -9,7 +9,7 @@
 CC=gcc
 CFLAGS=-Wall -Wextra -std=gnu99 -O2 -ggdb -g
 CFLAGS+= `pkg-config --cflags libusb-1.0`
-SOURCES=main.c
+SOURCES=main.c logging.c
 LIBS=-lusb-1.0
 OBJECTS=$(SOURCES:.c=.o)
 EXECUTABLE=switch_relay

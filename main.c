@@ -25,6 +25,7 @@
 #include <sys/inotify.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include "logging.h"
 
 /* Control IO via existence of files in Temp directory 
  * External programs can easily monitor this using inotify scripts
@@ -38,17 +39,19 @@
 #define EVENT_SIZE  ( sizeof (struct inotify_event) )
 #define EVENT_BUF_LEN     ( 1024 * ( EVENT_SIZE + 16 ) )
 
-static const uint16_t ch341a_USB_VENDOR_ID = 0x1a86;
-static const uint16_t ch341a_USB_PROUCT_ID = 0x5512;
-static const int ch341a_FIRST_PIN = 1;
-static const int ch341a_LAST_PIN = 8;
+static const int FIRST_RELAY_NO = 1;
+static const int LAST_RELAY_NO = 8;
+
+typedef enum device_brand
+{
+    ABACOM = 0, ELOMAX = 1, DEVICE_BRAND_LAST
+} device_brand_t;
 
 /* For API documentation see iosolution.h */
 /* I2CSolution van Elomax is USB device */
-static const uint16_t ELOMAX_USB_VENDOR_ID = 0x07a0;
-static const uint16_t ELOMAX_USB_PRODUCT_ID = 0x1008;
-#define SEND_PACKET_LEN 8
-#define USB_TIMEOUT 1000
+
+static const uint16_t vid_table[] = {0x1a86, 0x07a0};
+static const uint16_t pid_table[] = {0x5512, 0x1008};
 
 typedef struct
 {
@@ -58,18 +61,23 @@ typedef struct
 
     libusb_context *usb_context; // pointer to usb context
     libusb_device_handle *device_handle; // pointer to the usb device handle
-    uint32_t device_brand; /* 0 = ch341a 1= Elomax IOsolutions I2c device */
+    device_brand_t device_brand; /* 0 = ch341a 1= Elomax IOsolutions I2c device */
 
     /* flag when output needs to be sent, but is not yet done (retry later ?) */
     int output_pending; // cleared by write success 
-    int verbose; // verbose output to console
+    // int verbose; // verbose output to console
     int use_syslog; // use syslog for logging instead of console
     int run_as_daemon; // run as daemon, use /tmp/ID/D_OUT_99 inotify for control
     char *event_dir; // where to listen and send events
 } ios_handle_t;
 
 /* declaration */
+void USB_close_device(ios_handle_t *h);
+int USB_open_device(ios_handle_t *handle, uint16_t VID, uint16_t PID);
+int USB_setup_device(ios_handle_t *handle);
 int USB_write_IO(ios_handle_t *handle);
+int run_as_daemon(ios_handle_t *h);
+int run_once(ios_handle_t *h, int argc, char *argv[]);
 
 /* implementation */
 static int
@@ -96,15 +104,15 @@ ios_send(ios_handle_t *handle)
         fprintf(stderr, "could not send, handle==null\n");
         return (-1);
     }
-
+    static const int packet_len = 8;
     int writen_size = libusb_control_transfer(
                                               handle->device_handle, 0x21,
                                               LIBUSB_REQUEST_SET_CONFIGURATION,
                                               0x00, 0,
-                                              handle->data, SEND_PACKET_LEN,
-                                              1000);
+                                              handle->data, packet_len,
+                                              100);
 
-    if (writen_size != SEND_PACKET_LEN) {
+    if (writen_size != packet_len) {
         fprintf(stderr, "Failed to send all the byte of the packet (%i)\n", writen_size);
 
     }
@@ -116,8 +124,16 @@ int
 USB_setup_device(ios_handle_t *handle)
 {
     /* the elomax device needs some setup before accepting commands */
-    if (handle->device_brand == 1) {
+    assert(handle);
+    assert(handle->device_brand < DEVICE_BRAND_LAST);
+
+    switch (handle->device_brand) {
+    case ABACOM:
+        lwsl_debug("ABACOM, nothing to do, USB_setup_device()\n");
+        break;
+    case ELOMAX:
         /* Elomax setup */
+        lwsl_debug("ELOMAX, USB_setup_device() enable pull ups\n");
         /* setup the pull up resistors */
         handle->data[0] = 0x55;
         handle->data[1] = 0xFF;
@@ -142,14 +158,17 @@ USB_setup_device(ios_handle_t *handle)
                 }
             }
         }
-    } else {
-        /* no special handling for ch341a */
+        break;
+    default:
+        fprintf(stderr, "can not happen. invalid device brand\n");
     }
+
+
     return 0;
 }
 
 static int
-send_relay_cmd(libusb_device_handle *dev, uint8_t cmd, uint8_t verbose)
+send_relay_cmd(libusb_device_handle *dev, uint8_t cmd)
 {
     static const unsigned char ch341a_cmd_part1[] = {0xa1, 0x6a, 0x1f, 0x00, 0x10};
     static const unsigned char ch341a_cmd_part2[] = {0x3f, 0x00, 0x00, 0x00, 0x00};
@@ -171,14 +190,12 @@ send_relay_cmd(libusb_device_handle *dev, uint8_t cmd, uint8_t verbose)
     /* do usb action, rv !=0 on error */
     int rv = libusb_bulk_transfer(dev, endpointid, buf, numbytes, &actual_length, 100);
 
-    if (verbose) {
-        fprintf(stderr, "\n");
-        for (int i = 0; i < numbytes; i++)
-            fprintf(stderr, "pos=%02d val=%02x\n", i, buf[i]);
-    }
+
+    //for (int i = 0; i < numbytes; i++)
+    //    lwsl_debug("pos=%02d val=%02x", i, buf[i]);
 
     if (rv != 0)
-        fprintf(stderr, "libusb_bulk_transfer() failed\n");
+        lwsl_notice("libusb_bulk_transfer() failed");
 
     // return 0 on successful write
     return (numbytes != actual_length);
@@ -192,7 +209,7 @@ USB_write_IO(ios_handle_t *handle)
     libusb_device_handle *dev = handle->device_handle;
     assert(dev);
     uint8_t active_relays = (uint8_t) handle->active_relays;
-    uint8_t verbose = handle->verbose;
+    //uint8_t verbose = handle->verbose;
 
     if (handle->device_brand == 1) {
         // do the Elomax protocol
@@ -223,24 +240,24 @@ USB_write_IO(ios_handle_t *handle)
     } else {
         // do the ch341a protocol
         /* Send the command frame */
-        if (send_relay_cmd(dev, 0x00, verbose)) goto error;
+        if (send_relay_cmd(dev, 0x00)) goto error;
         /* send stuff for every bit in the mask */
         for (uint8_t mask = 128; mask > 0; mask >>= 1) {
             if (active_relays & mask) {
                 /* Send "relay on" */
-                if (send_relay_cmd(dev, 0x20, verbose)) goto error;
-                if (send_relay_cmd(dev, 0x28, verbose)) goto error;
-                if (send_relay_cmd(dev, 0x20, verbose)) goto error;
+                if (send_relay_cmd(dev, 0x20)) goto error;
+                if (send_relay_cmd(dev, 0x28)) goto error;
+                if (send_relay_cmd(dev, 0x20)) goto error;
             } else {
                 /* Send "relay off" */
-                if (send_relay_cmd(dev, 0x00, verbose)) goto error;
-                if (send_relay_cmd(dev, 0x08, verbose)) goto error;
-                if (send_relay_cmd(dev, 0x00, verbose)) goto error;
+                if (send_relay_cmd(dev, 0x00)) goto error;
+                if (send_relay_cmd(dev, 0x08)) goto error;
+                if (send_relay_cmd(dev, 0x00)) goto error;
             }
         }
         /* End the command frame */
-        if (send_relay_cmd(dev, 0x00, verbose)) goto error;
-        if (send_relay_cmd(dev, 0x01, verbose)) goto error;
+        if (send_relay_cmd(dev, 0x00)) goto error;
+        if (send_relay_cmd(dev, 0x01)) goto error;
     }
 
     /* Remember the status */
@@ -268,7 +285,7 @@ USB_open_device(ios_handle_t *handle, uint16_t VID, uint16_t PID)
     handle->usb_context = ctx;
 
     if (r < 0) {
-        fprintf(stderr, "Init Error %d\n", r); // there was an error
+        lwsl_err("Init Error %d\n", r); // there was an error
         return -1;
     }
 
@@ -276,20 +293,19 @@ USB_open_device(ios_handle_t *handle, uint16_t VID, uint16_t PID)
 
     ssize_t cnt = libusb_get_device_list(ctx, &devs); // get the list of devices
     if (cnt < 0) {
-        fprintf(stderr, "Get Device Error\n"); // there was an error
+        lwsl_err("Get Device Error\n"); // there was an error
         return -1;
     }
 
-    if (handle->verbose)
-        fprintf(stderr, "[%ld] Devices in list.\n", cnt);
+
+    lwsl_info("[%ld] Devices in list.\n", cnt);
 
     udh = libusb_open_device_with_vid_pid(ctx, VID, PID); // ch341a_USB_VENDOR_ID, ch341a_USB_PROUCT_ID
     if (!udh) {
-        fprintf(stderr, "Cannot open device: libusb %p\n", udh);
+        lwsl_warn("Cannot open device: libusb %p\n", udh);
         return -1;
     } else {
-        if (handle->verbose)
-            fprintf(stderr, "Device is open\n");
+        lwsl_info("Device is open\n");
 
         handle->device_handle = udh; // copy for later use
     }
@@ -297,28 +313,25 @@ USB_open_device(ios_handle_t *handle, uint16_t VID, uint16_t PID)
     libusb_free_device_list(devs, 1); // free the list, unref the devices in it
 
     if (libusb_kernel_driver_active(udh, 0) == 1) { // find out if kernel driver is attached
-        if (handle->verbose)
-            fprintf(stderr, "Kernel Driver Active\n");
+        lwsl_info("Kernel Driver Active\n");
 
-        if (libusb_detach_kernel_driver(udh, 0) == 0) {// detach it
-            if (handle->verbose)
-                fprintf(stderr, "Kernel Driver Detached!\n");
-            else
-                fprintf(stderr, "Kernel Driver Detach failed!\n");
-        }
+        if (libusb_detach_kernel_driver(udh, 0) == 0) // detach it
+            lwsl_info("Kernel Driver Detached!\n");
+        else
+            lwsl_info("Kernel Driver Detach failed!\n");
+
     }
 
     r = libusb_claim_interface(udh, 0); // claim interface 0 
 
     if (r < 0) {
-        fprintf(stderr, "Cannot Claim Interface : %d\n", r);
+        lwsl_info("Cannot Claim Interface : %d\n", r);
         handle->device_handle = NULL;
         handle->output_pending = 1;
         return -1;
     }
 
-    if (handle->verbose)
-        fprintf(stderr, "Claimed Interface\n");
+    lwsl_info("Claimed Interface\n");
 
     handle->output_pending = 1;
 
@@ -343,7 +356,7 @@ run_once(ios_handle_t *h, int argc, char *argv[])
     /* just set some outputs on or off and quit */
     for (int i = optind; i < argc; i++) {
         int relay = atoi(argv[i]);
-        if (relay < ch341a_FIRST_PIN || relay > ch341a_LAST_PIN) {
+        if (relay < FIRST_RELAY_NO || relay > LAST_RELAY_NO) {
             fprintf(stderr, "error: only give valid relay numbers (1-8) as parameter\n");
             fprintf(stderr, "you can use -v as first option to enable verbose output debugging\n");
             fprintf(stderr, "example: ./%s -v 1 5 7 will switch 1 5 and 7 on the rest will be off\n", argv[0]);
@@ -351,22 +364,16 @@ run_once(ios_handle_t *h, int argc, char *argv[])
         }
         h->active_relays |= (1 << (relay - 1));
     }
-    if (h->verbose)
-        fprintf(stderr, "writing byte %d to usb\n", h->active_relays);
+    lwsl_debug("writing byte %d to usb\n", h->active_relays);
 
-    int vid = ch341a_USB_VENDOR_ID;
-    int pid = ch341a_USB_PROUCT_ID;
-    if (h->device_brand == 1) {
-        vid = ELOMAX_USB_VENDOR_ID;
-        pid = ELOMAX_USB_PRODUCT_ID;
-    }
-
-    if (0 == USB_open_device(h, vid, pid)) {
+    if (0 == USB_open_device(h,
+                             vid_table[h->device_brand],
+                             pid_table[h->device_brand])) {
         USB_setup_device(h);
         USB_write_IO(h);
         USB_close_device(h);
     } else {
-        fprintf(stderr, "Error : device not open\n");
+        lwsl_warn("Error : device not open\n");
         return 3;
     }
     return 0;
@@ -375,25 +382,21 @@ run_once(ios_handle_t *h, int argc, char *argv[])
 int
 run_as_daemon(ios_handle_t *h)
 {
-    if (h->verbose)
-        fprintf(stderr, "Keep Running, daemon not forking, eventpath=%s pid=%d\n",
-                h->event_dir, getpid());
+    assert(h);
+    assert(h->device_brand < DEVICE_BRAND_LAST);
 
-    int vid = ch341a_USB_VENDOR_ID;
-    int pid = ch341a_USB_PROUCT_ID;
-
-    if (h->device_brand == 1) {
-        vid = ELOMAX_USB_VENDOR_ID;
-        pid = ELOMAX_USB_PRODUCT_ID;
-    }
+    lwsl_info("Keep Running, daemon not forking, eventpath=%s pid=%d\n",
+              h->event_dir, getpid());
 
     /* connect to USB IO board */
     while (1) {
-        if (0 == USB_open_device(h, vid, pid)) {
+        if (0 == USB_open_device(h,
+                                 vid_table[h->device_brand],
+                                 pid_table[h->device_brand])) {
             USB_setup_device(h);
             break;
         } else {
-            fprintf(stderr, "IO board not found, try again in 1 sec\n");
+            lwsl_info("IO board not found, try again in 1 sec\n");
             sleep(1);
         }
     }
@@ -412,23 +415,27 @@ run_as_daemon(ios_handle_t *h)
         perror("inotify_init");
 
     wd = inotify_add_watch(fd, h->event_dir, IN_ALL_EVENTS);
-    // IN_OPEN | IN_CLOSE | IN_CREATE | IN_DELETE | IN_DELETE_SELF);
 
     if (wd < 0)
         perror("inotify_add_watch");
 
-    /* set initial outputs based on stat() of files already present 
-     h->active_relays |= (1 << (relay - 1));
-     */
-    char b[4096] = {0};
-    struct stat sb;
-    unsigned relaybits = 0;
-    for (i = ch341a_FIRST_PIN; i != ch341a_LAST_PIN; i++) {
+    /* set initial outputs based on stat() of files already present */
+
+    char b[4096] = {0}; /* file name buffer */
+    struct stat sb; /* stat result buffer */
+    unsigned relaybits = 0; /* bitpattern to set the relays to, clear */
+
+    /* loop over files, stat() files, set bits in pattern */
+
+    for (i = FIRST_RELAY_NO; i < (LAST_RELAY_NO + 1); i++) {
         int len = snprintf(b, sizeof (b), "%s/D_OUT_%d", h->event_dir, i);
-        if (h->verbose)
-            fprintf(stderr, "stat( %s ) len=%d\n", b, len);
+        lwsl_debug("stat( %s ) len=%d\n", b, len);
         if (stat(b, &sb) == 0) {
+            lwsl_debug("output (%d) ON\n", i);
             relaybits |= (1 << (i - 1));
+        } else {
+            lwsl_debug("output (%d) OFF\n", i);
+
         }
     }
 
@@ -456,34 +463,28 @@ run_as_daemon(ios_handle_t *h)
 
                 if (event->mask & IN_CREATE) {
                     if (event->mask & IN_ISDIR) {
-                        if (h->verbose)
-                            fprintf(stderr, "New directory %s created.\n", event->name);
+                        lwsl_debug("New directory %s created.\n", event->name);
                     } else {
-                        if (h->verbose)
-                            fprintf(stderr, "New file %s created.\n", event->name);
+                        lwsl_debug("New file %s created.\n", event->name);
                         /* check pattern */
                         int pin = 0;
                         if (sscanf(event->name, "D_OUT_%d", &pin)) {
                             h->active_relays |= 1 << (pin - 1);
-                            if (h->verbose)
-                                fprintf(stderr, "set pin=%d HIGH\n", pin);
+                            lwsl_info("set pin=%d HIGH\n", pin);
                             eventcounter++;
                         }
                     }
                 } else if (event->mask & IN_DELETE) {
                     if (event->mask & IN_ISDIR) {
-                        if (h->verbose)
-                            fprintf(stderr, "Directory %s deleted.\n", event->name);
+                        lwsl_debug("Directory %s deleted.\n", event->name);
                     } else {
-                        if (h->verbose)
-                            fprintf(stderr, "File %s deleted.\n", event->name);
+                        lwsl_debug("File %s deleted.\n", event->name);
                         /* check pattern */
                         int pin = 0;
                         if (sscanf(event->name, "D_OUT_%d", &pin)) {
                             h->active_relays &= ~(1 << (pin - 1));
 
-                            if (h->verbose)
-                                fprintf(stderr, "set pin=%d LOW\n", pin);
+                            lwsl_info("set pin=%d LOW\n", pin);
                             eventcounter++;
                         }
                     }
@@ -514,6 +515,9 @@ main(int argc, char *argv[])
 
     ios_handle_t *h = calloc(1, sizeof (ios_handle_t));
     int rc = 0; // return value to shell
+    extern int log_level; //  default
+    lwsl_emit = lwsl_emit_stderr; // log to stderr until we change it
+
     /* 
      * use old style getopt() to be compatible
      * opterr, optopt, optind, optarg are from <unistd.h>
@@ -522,13 +526,12 @@ main(int argc, char *argv[])
     opterr = 0;
     int c;
 
-    while ((c = getopt(argc, argv, "dhi:svm:")) != -1)
+    while ((c = getopt(argc, argv, "dhi:sm:z:")) != -1)
         switch (c) {
-        case 'v':
-            h->verbose = 1;
-            break;
+
         case 's':
             h->use_syslog = 1;
+            lwsl_emit = lwsl_emit_syslog;
             break;
         case 'd':
             h->run_as_daemon = 1;
@@ -543,18 +546,27 @@ main(int argc, char *argv[])
         case 'm':
             /* device brand/protocol 0=ch341 1=elomax */
             h->device_brand = atoi(optarg);
-            if (h->device_brand > 1) {
-                fprintf(stderr, "devicebrand must be 0 or 1, (ch341=0 or Elomax=1)\n");
+            if (h->device_brand >= DEVICE_BRAND_LAST) {
+                fprintf(stderr, "devicebrand must be < %d, (ABACOM=0 or Elomax=1)\n", DEVICE_BRAND_LAST);
                 abort();
             }
+            break;
+        case 'z': /* set log level */
+            log_level = atoi(optarg);
+            if (log_level > 31) {
+                // loglevel out of range
+                fprintf(stderr, "loglevel (-z %d) out of range\n", log_level);
+                fprintf(stderr, "valid levels : ERR = 1, WARN =2, NOTICE=4, INFO=8, DEBUG=16 OR together");
+                abort();
+            }
+            lws_set_log_level(log_level, lwsl_emit_stderr);
             break;
 
         default:
             abort();
         }
 
-    if (h->verbose)
-        fprintf(stderr, "verbose = %s\n", h->verbose ? "Yes" : "No");
+
 
     if (h->run_as_daemon) {
         /* we keep running until the end of time (or signal) */

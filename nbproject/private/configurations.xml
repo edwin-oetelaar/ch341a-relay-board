@@ -4,6 +4,8 @@
     <df root="." name="project_userspace">
       <df name="images">
       </df>
+      <in>logging.c</in>
+      <in>logging.h</in>
       <in>main.c</in>
     </df>
   </logicalFolder>
