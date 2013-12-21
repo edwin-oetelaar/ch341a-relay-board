@@ -1,4 +1,6 @@
-Project : CH341A relay board
+Project : CH341A relay board, simple control from PC or Raspberry PI
+Using Inotify : Create file: turn relay on
+
 Using just plain linux and libusb-1.0 control the relays
 This document was written by Edwin van den Oetelaar, please leave my name intact.
 
@@ -11,7 +13,7 @@ Connect the board using a usb cable.
 Make sure you have enough rights to control the USB device 
 (see if it is present with lsusb command)
 $ lsusb
-Bus 002 Device 024: ID 1a86:5512 Unknown 
+Bus 002 Device 024: ID 1a86:5512 QinHeng Electronics 
 
 If you need to run the board as a normal user you need to a a rule to udev to allow it
 My group was 'oetelaar' make sure you set up your group correctly, not my group name!! 
@@ -34,11 +36,42 @@ $ cat /etc/udev/rules.d/60-OETEL-IOSOLUTION-ABACOM.rules
 # end of file
 
 Usage Examples: 
-# run as root if you do not have udev set up correctly
-sudo ./switch_relay 1 2
+run as root if you do not have udev set up correctly
 
-# verbose logging (and as normal user)
-./switch_relay -v 1 8 
+$ sudo ./switch_relay 1 2
+
+$ switch relay 1 and 8 on, rest is off (and as normal user)
+$ ./switch_relay 1 8 
+
+=== detailed usage ===
+Name : switch_relay - switch relays on Abacom or Elomax board on or off
+Can be run once, to set some relays or
+can run as a directory monitor using inotify, will switch relays when files are created or removed
+
+switch_relay [options] [relay_number] [relay_number]
+options:
+ -s : use syslog for logging instead of stderr
+ -d : keep running (as a daemon) does not fork (use something like supervisord)
+ -i <directory_name> : use event listing on this directory instead of /tmp
+ -h : show help text
+ -m <0|1> : use Abacom=0 (default) or Elmax=1 protocol and device
+ -z loglevel : set loglevel (default=7) valid levels : ERR = 1, WARN =2, NOTICE=4, INFO=8, DEBUG=16 OR together
+
+
+Usage example:
+ $ switch_relay  : switch all relays off
+ $ switch_relay 4 : switch all relays off, but switch relay 4 on
+ $ switch_relay -s -d -z 31 : use syslog, keep running, use maximum logging
+
+When using (-d) the program will monitor /tmp/ for creation or removal of files
+ /tmp/D_OUT_1 /tmp/D_OUT_2 .. /tmp_D_OUT_8
+ create a file with that name and the output will be active (on) remove the file and the output will deactivate (off)
+
+example :
+ $ touch /tmp/D_OUT_1 : will active relay no 1
+ $ rm /tmp/D_OUT_1    : will switch relay off again
+
+
 
 Board can be bought here:
 http://www.electronic-software-shop.com/hardware/relais/usb-relaiskarte-lrb-8-fach.html

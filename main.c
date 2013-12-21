@@ -25,6 +25,7 @@
 #include <sys/inotify.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include "main.h"
 #include "logging.h"
 
 /* Control IO via existence of files in Temp directory 
@@ -86,9 +87,9 @@ ios_send(ios_handle_t *handle)
     /* bmRequest Type	 
      * Bit 7: Request direction (0=Host to device – Out, 1=Device to host – In).
      * Bits 5-6: Request type (0=standard, 1=class, 2=vendor, 3=reserved).
-     *  Bits 0-4: Recipient (0=device, 1=interface, 2=endpoint, 3=other).
-     */
-    /* int usb_control_msg(
+     * Bits 0-4: Recipient (0=device, 1=interface, 2=endpoint, 3=other).
+     *
+     * int usb_control_msg(
      * usb_dev_handle *dev,
      * int requesttype, 0x21 see doc
      * int request, 0x09 (set configuration)
@@ -100,7 +101,7 @@ ios_send(ios_handle_t *handle)
      * */
     //libusb_set_configuration()
     /* 0x21 Byte : 0010 0001 , class, interface, host to device */
-    if (handle->device_handle == NULL) {
+    if (NULL == handle->device_handle) {
         fprintf(stderr, "could not send, handle==null\n");
         return (-1);
     }
@@ -211,7 +212,7 @@ USB_write_IO(ios_handle_t *handle)
     uint8_t active_relays = (uint8_t) handle->active_relays;
     //uint8_t verbose = handle->verbose;
 
-    if (handle->device_brand == 1) {
+    if (ELOMAX == handle->device_brand) {
         // do the Elomax protocol
         handle->data[0] = 0x4F; /* command for i2csolution */
         handle->data[1] = 0x00; /* port 0 output */
@@ -275,7 +276,7 @@ error:
 int
 USB_open_device(ios_handle_t *handle, uint16_t VID, uint16_t PID)
 {
-    assert(handle->device_handle == NULL);
+    assert(NULL == handle->device_handle);
 
     libusb_device **devs = {0}; // to retrieve a list of devices
     libusb_device_handle *udh = NULL;
@@ -515,7 +516,7 @@ main(int argc, char *argv[])
 
     ios_handle_t *h = calloc(1, sizeof (ios_handle_t));
     int rc = 0; // return value to shell
-    extern int log_level; //  default
+    extern int log_level; //  default is 7
     lwsl_emit = lwsl_emit_stderr; // log to stderr until we change it
 
     /* 
@@ -540,8 +541,8 @@ main(int argc, char *argv[])
             h->event_dir = strdup(optarg);
             break;
         case 'h':
-            fprintf(stderr, "Help Text here");
-            abort();
+            fprintf(stderr, _helptext);
+            exit(1);
             break;
         case 'm':
             /* device brand/protocol 0=ch341 1=elomax */
@@ -563,14 +564,15 @@ main(int argc, char *argv[])
             break;
 
         default:
-            abort();
+            fprintf(stderr,"do we get here?\n");
+            exit(1);
         }
 
 
 
     if (h->run_as_daemon) {
         /* we keep running until the end of time (or signal) */
-        if (h->event_dir == 0) {
+        if (0 == h->event_dir) {
             fprintf(stderr, "using /tmp as default event directory\n");
             h->event_dir = strdup("/tmp");
         }

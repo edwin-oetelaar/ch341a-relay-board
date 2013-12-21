@@ -1,3 +1,9 @@
+/*
+ * http://git.libwebsockets.org/cgi-bin/cgit/libwebsockets/
+ * Taken from libwebsockets by Andy Green (GPL)
+ * $Id:$
+ */
+
 #include "logging.h"
 
 void

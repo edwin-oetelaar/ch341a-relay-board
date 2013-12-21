@@ -1,8 +1,6 @@
 /* 
- * File:   logging.h
- * Author: oetelaar
- *
- * Created on July 15, 2013, 9:16 PM
+ * Taken from http://git.libwebsockets.org/cgi-bin/cgit/libwebsockets/
+ * written by Andy Green (GPL)
  */
 
 #ifndef LOGGING_H
@@ -64,4 +62,3 @@ static const char * const log_level_names[] = {
 #endif
 
 #endif	/* LOGGING_H */
-
